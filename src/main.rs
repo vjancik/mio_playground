@@ -11,9 +11,8 @@ use runtime::*;
 //     println!("Function: Thread {}: Hello world", ix);
 // }
 
-fn udp_handler_factory() -> Box<runtime::Handler<ThreadData>> 
+fn udp_handler_factory() -> Box<runtime::SourceEvHandler<ThreadData>> 
 { 
-    // TODO: Must exhaust socket
     Box::new(move |_runtime, thread_data, _event| {
         let mut buf = [0u8; 1500];
 
@@ -63,7 +62,7 @@ fn main() -> Result<()> {
 
     let now = time::Instant::now();
     let timer = Duration::from_millis(1000);
-    runtime::register_timer_event(&runtime, timer, true, Box::new(move || {
+    runtime::register_timer_event(&runtime, timer, true, Box::new(move |_runtime| {
         println!("Printing every {:?}, elapsed: {}", timer, now.elapsed().as_millis());
         Ok(())
     }));
@@ -72,7 +71,7 @@ fn main() -> Result<()> {
     let send_sock = std::net::UdpSocket::bind("[::0]:0")?;
     let msg = "Hello world".as_bytes();
 
-    runtime::register_timer_event(&runtime, Duration::from_millis(500), true, Box::new(move || {
+    runtime::register_timer_event(&runtime, Duration::from_millis(500), true, Box::new(move |_runtime| {
         send_sock.send_to(msg, format!("[::0]:{}", port))?;
         Ok(())
     }));
