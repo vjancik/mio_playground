@@ -166,8 +166,8 @@ impl<TD: Send + Sync + 'static> Runtime<TD> {
 
 
     #[inline]
-    fn trigger_timer_event(event: &mut TimerEvent<TD>, /* delay: time::Duration,*/ runtime: &mut Arc<RwLock<Self>>) -> Result<()> {
-        // ev_write.last_triggered = Some(ev_write.next_trigger + delay);
+    fn trigger_timer_event(event: &mut TimerEvent<TD>, delay: time::Duration, runtime: &mut Arc<RwLock<Self>>) -> Result<()> {
+        event.last_triggered = Some(event.next_trigger + delay);
         event.next_trigger += event.timer;
         (*event.handler)(runtime)?;
         Ok(())
@@ -176,10 +176,12 @@ impl<TD: Send + Sync + 'static> Runtime<TD> {
     fn handle_timer_events(timer_events: &mut SmallVec<[TimerEvent<TD>; 10]>, runtime: &mut Arc<RwLock<Self>>) -> Result<()> {
         let now = time::Instant::now();
         let timer_events = timer_events.iter_mut()
-            // use filter_map to preserve delay
-            .filter(|event| { now.checked_duration_since(event.next_trigger).is_some() });
-        for event in timer_events {
-            Self::trigger_timer_event(event, /*delay,*/ runtime)?;
+            .filter_map(|event| { 
+                if let Some(delay) = now.checked_duration_since(event.next_trigger) {
+                    Some((event, delay))
+                } else { None }});
+        for (event, delay) in timer_events {
+            Self::trigger_timer_event(event, delay, runtime)?;
         }
         Ok(())
     }
