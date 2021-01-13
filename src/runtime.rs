@@ -1,18 +1,23 @@
 use std::thread;
 use std::sync::Arc;
 use std::time::{self, Duration};
+use std::ops::{Deref, DerefMut};
 // use std::iter;
 use mio;
 use anyhow::Result;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
-use signal_hook;
+// use signal_hook;
 
 const AVG_CORES: usize = 8;
 
 // type Callback<TD> = dyn Fn(TD) -> Result<()> + Send + Sync;
 pub type TimerEvHandler<TD> = dyn Fn(&mut Arc<RwLock<Runtime<TD>>>) -> Result<()> + Send + Sync;
 pub type SourceEvHandler<TD> = dyn Fn(&mut Arc<RwLock<Runtime<TD>>>, &mut TD, &mio::event::Event) -> Result<()> + Send + Sync;
+
+pub struct RuntimeInstance<TD: Send + Sync + 'static> {
+    instance: Arc<RwLock<Runtime<TD>>>
+}
 
 pub struct Runtime<TD: Send + Sync + 'static> {
     nthreads: usize,
@@ -45,9 +50,9 @@ struct TimerEvent<TD: Send + Sync + 'static> {
     repeat: bool,
 }
 
-struct SignalEvent {
-    signal: std::os::raw::c_int,
-}
+// struct SignalEvent {
+//     signal: std::os::raw::c_int,
+// }
 
 struct SourceEvent<TD: Send + Sync + 'static> {
     source_id: mio::Token,
@@ -60,57 +65,98 @@ fn wake_all<'a, T: Iterator<Item=&'a Arc<mio::Waker>>>(wakers: T) {
     }
 }
 
-pub fn send_stop_signal<TD: Send + Sync + 'static>(runtime: &mut Arc<RwLock<Runtime<TD>>>) {
-    runtime.write().should_exit = true;
-    wake_all(runtime.read().wakers.iter());
+ impl<TD: Send + Sync + 'static> Deref for RuntimeInstance<TD> {
+    type Target = Arc<RwLock<Runtime<TD>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.instance
+    }
 }
 
-/// if repeat is true, the timer becomes periodic until cancelled
-pub fn register_timer_event<TD: Send + Sync + 'static>(runtime: &Arc<RwLock<Runtime<TD>>>, timer: time::Duration, 
-    repeat: bool, handler: Box<TimerEvHandler<TD>>) 
-where TD: Send + Sync + 'static {
-    let mut rwrite = runtime.write();
-    let rt_cloned = Arc::downgrade(&runtime);
+impl<TD: Send + Sync + 'static> DerefMut for RuntimeInstance<TD> {
+    fn deref_mut(&mut self) -> &mut Arc<RwLock<Runtime<TD>>> {
+        &mut self.instance
+    }
+}
 
-    let event_ix = rwrite.get_next_event_ix();
-    let next_trigger = time::Instant::now() + timer;
+impl<TD: Send + Sync + 'static> From<Arc<RwLock<Runtime<TD>>>> for RuntimeInstance<TD> {
+    fn from(src: Arc<RwLock<Runtime<TD>>>) -> Self {
+        RuntimeInstance { instance: src }
+    }
+}
 
-    let timer_ev = TimerEvent { 
-        event_ix, handler, repeat, last_triggered: None, timer, next_trigger 
-    };
-    rwrite.timer_events.write().push(timer_ev);
+impl<TD: Send + Sync + 'static> RuntimeInstance<TD> {
+    /// if repeat is true, the timer becomes periodic until cancelled
+    pub fn register_timer_event<>(&self, timer: time::Duration,  repeat: bool, handler: Box<TimerEvHandler<TD>>) 
+    where TD: Send + Sync + 'static {
+        let mut rwrite = self.instance.write();
+        let rt_cloned = Arc::downgrade(&self.instance);
+    
+        let event_ix = rwrite.get_next_event_ix();
+        let next_trigger = time::Instant::now() + timer;
+    
+        let timer_ev = TimerEvent { 
+            event_ix, handler, repeat, last_triggered: None, timer, next_trigger 
+        };
+        rwrite.timer_events.write().push(timer_ev);
+    
+        thread::spawn(move || -> Result<()> {
+            loop { 
+                thread::sleep(timer);
+                // println!("Waking");
+                if let Some(rt_cloned) = rt_cloned.upgrade() {
+                    if rt_cloned.read().should_exit { break; }
+    
+                    let wakers: SmallVec<[Arc<mio::Waker>; AVG_CORES]> = rt_cloned.read().wakers.iter().cloned().collect();
+                    wake_all(wakers.iter());
+                    if !repeat {
+                        break;
+                    }
+                } else { break; }
+                // TODO: cancellation check here
+                // for event in runtime.write().timer_events.iter_mut().filter(
+                //     |item| { item.event_ix == event_ix }) {
+                //     event.handled = false;
+                // }
+            }
+            Ok(())
+        });
+        // rwrite.join_handles.push(Some(handle));
+    }
 
-    thread::spawn(move || -> Result<()> {
-        loop { 
-            thread::sleep(timer);
-            // println!("Waking");
-            if let Some(rt_cloned) = rt_cloned.upgrade() {
-                if rt_cloned.read().should_exit { break; }
+    #[inline]
+    fn trigger_timer_event(&mut self, event: &mut TimerEvent<TD>, delay: time::Duration) -> Result<()> {
+        event.last_triggered = Some(event.next_trigger + delay);
+        event.next_trigger += event.timer;
+        (*event.handler)(self)?;
+        Ok(())
+    }
 
-                let wakers: SmallVec<[Arc<mio::Waker>; AVG_CORES]> = rt_cloned.read().wakers.iter().cloned().collect();
-                wake_all(wakers.iter());
-                if !repeat {
-                    break;
-                }
-            } else { break; }
-            // TODO: cancellation check here
-            // for event in runtime.write().timer_events.iter_mut().filter(
-            //     |item| { item.event_ix == event_ix }) {
-            //     event.handled = false;
-            // }
+    fn handle_timer_events(&mut self, timer_events: &mut SmallVec<[TimerEvent<TD>; 10]>) -> Result<()> {
+        let now = time::Instant::now();
+        let timer_events = timer_events.iter_mut()
+            .filter_map(|event| { 
+                if let Some(delay) = now.checked_duration_since(event.next_trigger) {
+                    Some((event, delay))
+                } else { None }});
+        for (event, delay) in timer_events {
+            self.trigger_timer_event(event, delay)?;
         }
         Ok(())
-    });
-    // rwrite.join_handles.push(Some(handle));
-}
-
-pub fn block_until_finished<TD: Send + Sync + 'static>(runtime: Arc<RwLock<Runtime<TD>>>) -> Result<()> {
-    let join_handles: SmallVec<[thread::JoinHandle<Result<()>>; AVG_CORES]> = runtime.write().join_handles.iter_mut()
-        .map(|item| { item.take().unwrap() }).collect();
-    for handle in join_handles {
-        handle.join().unwrap()?;
     }
-    Ok(())
+
+    pub fn send_stop_signal(&self) {
+        self.instance.write().should_exit = true;
+        wake_all(self.instance.read().wakers.iter());
+    }
+    
+    pub fn block_until_finished(self) -> Result<()> {
+        let join_handles: SmallVec<[thread::JoinHandle<Result<()>>; AVG_CORES]> = self.instance.write().join_handles.iter_mut()
+            .map(|item| { item.take().unwrap() }).collect();
+        for handle in join_handles {
+            handle.join().unwrap()?;
+        }
+        Ok(())
+    }
 }
 
 impl<TD: Send + Sync + 'static> Runtime<TD> {
@@ -180,28 +226,6 @@ impl<TD: Send + Sync + 'static> Runtime<TD> {
         self.thread_data[thread_ix] = Some(data);
     }
 
-
-    #[inline]
-    fn trigger_timer_event(event: &mut TimerEvent<TD>, delay: time::Duration, runtime: &mut Arc<RwLock<Self>>) -> Result<()> {
-        event.last_triggered = Some(event.next_trigger + delay);
-        event.next_trigger += event.timer;
-        (*event.handler)(runtime)?;
-        Ok(())
-    }
-
-    fn handle_timer_events(timer_events: &mut SmallVec<[TimerEvent<TD>; 10]>, runtime: &mut Arc<RwLock<Self>>) -> Result<()> {
-        let now = time::Instant::now();
-        let timer_events = timer_events.iter_mut()
-            .filter_map(|event| { 
-                if let Some(delay) = now.checked_duration_since(event.next_trigger) {
-                    Some((event, delay))
-                } else { None }});
-        for (event, delay) in timer_events {
-            Self::trigger_timer_event(event, delay, runtime)?;
-        }
-        Ok(())
-    }
-
     fn prune_timer_events(timer_events: &mut SmallVec<[TimerEvent<TD>; 10]> ) {
         let now = time::Instant::now();
         timer_events.retain(|event| {
@@ -212,7 +236,7 @@ impl<TD: Send + Sync + 'static> Runtime<TD> {
         });
     }
 
-    fn executor_loop_factory(mut runtime: Arc<RwLock<Self>>, poll: mio::Poll, thread_data: TD, thread_ix: usize)
+    fn executor_loop_factory(mut instance: RuntimeInstance<TD>, poll: mio::Poll, thread_data: TD, thread_ix: usize)
         -> impl FnOnce() -> Result<()>
     { move || { 
         let mut poll = poll;
@@ -227,23 +251,23 @@ impl<TD: Send + Sync + 'static> Runtime<TD> {
         'event_loop: loop {
             poll.poll(&mut events, None)?;
             for event in events.iter() {
-                let handlers: SmallVec<[Arc<SourceEvent<TD>>; 1]> = runtime.read().source_handlers.iter()
+                let handlers: SmallVec<[Arc<SourceEvent<TD>>; 1]> = instance.read().source_handlers.iter()
                     .filter(|source_ev| { source_ev.source_id == event.token() })
                     .cloned().collect();
                 for source_ev in handlers {
-                    (*source_ev.handler)(&mut runtime, &mut thread_data, event)?;
+                    (*source_ev.handler)(&mut instance, &mut thread_data, event)?;
                 }
                 // Token(thread_ix) is Waker
                 if event.token() == mio::Token(thread_ix) {
                     // println!("Thread {} awoken.", thread_ix);
-                    let timer_events = runtime.read().timer_events.clone();
+                    let timer_events = instance.read().timer_events.clone();
                     // acts like a Mutex to prevent double triggering
                     let mut timer_ev_write = timer_events.write();
-                    Self::handle_timer_events(&mut timer_ev_write, &mut runtime)?;
+                    instance.handle_timer_events(&mut timer_ev_write)?;
                     Self::prune_timer_events(&mut timer_ev_write);
                     drop(timer_ev_write);
 
-                    if runtime.read().should_exit {
+                    if instance.read().should_exit {
                         break 'event_loop;
                     }
                 }
@@ -253,12 +277,12 @@ impl<TD: Send + Sync + 'static> Runtime<TD> {
         Ok(())
     }}
 
-    pub fn start(self) -> Arc<RwLock<Self>> {
-        let runtime = Arc::new(RwLock::new(self));
+    pub fn start(self) -> RuntimeInstance<TD> {
+        let runtime = RuntimeInstance { instance: Arc::new(RwLock::new(self)) };
         let mut rwrite = runtime.write();
 
         for i in 0..rwrite.nthreads {
-            let handle = thread::spawn(Self::executor_loop_factory(runtime.clone(), 
+            let handle = thread::spawn(Self::executor_loop_factory(runtime.clone().into(), 
                 rwrite.polls[i].take().unwrap(), rwrite.thread_data[i].take().unwrap(), i));
 
             rwrite.join_handles.push(Some(handle));

@@ -58,11 +58,11 @@ fn main() -> Result<()> {
         runtime.set_thread_data(i, ThreadData { thread_ix: i, udp_socket: mio_sock });
     }
 
-    let mut runtime = runtime.start();
+    let instance = runtime.start();
 
     let now = time::Instant::now();
     let timer = Duration::from_millis(1000);
-    runtime::register_timer_event(&runtime, timer, true, Box::new(move |_runtime| {
+    instance.register_timer_event(timer, true, Box::new(move |_runtime| {
         println!("Printing every {:?}, elapsed: {}", timer, now.elapsed().as_millis());
         Ok(())
     }));
@@ -72,15 +72,15 @@ fn main() -> Result<()> {
     let msg = "Hello world".as_bytes();
 
     // let now = time::Instant::now();
-    runtime::register_timer_event(&runtime, Duration::from_millis(500), true, Box::new(move |_runtime| {
+    instance.register_timer_event(Duration::from_millis(500), true, Box::new(move |_runtime| {
         // println!("Sending message, elapsed: {}", now.elapsed().as_millis());
         send_sock.send_to(msg, format!("[::1]:{}", port))?;
         Ok(())
     }));
 
     thread::sleep(Duration::from_secs(5));
-    runtime::send_stop_signal(&mut runtime);
+    instance.send_stop_signal();
 
-    runtime::block_until_finished(runtime)?;
+    instance.block_until_finished()?;
     Ok(())
 }
