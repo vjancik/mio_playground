@@ -1,6 +1,7 @@
 use std::thread;
 use std::sync::Arc;
 use std::time::{self, Duration};
+// use std::iter;
 use mio;
 use anyhow::Result;
 use parking_lot::RwLock;
@@ -25,6 +26,7 @@ pub struct Runtime<TD: Send + Sync + 'static> {
     next_token: usize,
     next_event_ix: usize,
     started: bool,
+    should_exit: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -33,7 +35,7 @@ struct EventIndex(usize);
 /// Can trigger multiple times in rapid succession if multiple timer periods were missed
 struct TimerEvent<TD: Send + Sync + 'static> {
     //TODO: cancelling
-    #[allow(dead_code)]
+    // #[allow(dead_code)]
     event_ix: EventIndex,
     // TODO: change to runtime shared data callback
     handler: Box<TimerEvHandler<TD>>,
@@ -52,12 +54,23 @@ struct SourceEvent<TD: Send + Sync + 'static> {
     handler: Box<SourceEvHandler<TD>>
 }
 
+fn wake_all<'a, T: Iterator<Item=&'a Arc<mio::Waker>>>(wakers: T) {
+    for waker in wakers {
+        waker.wake().ok();
+    }
+}
+
+pub fn send_stop_signal<TD: Send + Sync + 'static>(runtime: &mut Arc<RwLock<Runtime<TD>>>) {
+    runtime.write().should_exit = true;
+    wake_all(runtime.read().wakers.iter());
+}
+
 /// if repeat is true, the timer becomes periodic until cancelled
 pub fn register_timer_event<TD: Send + Sync + 'static>(runtime: &Arc<RwLock<Runtime<TD>>>, timer: time::Duration, 
     repeat: bool, handler: Box<TimerEvHandler<TD>>) 
 where TD: Send + Sync + 'static {
     let mut rwrite = runtime.write();
-    let rt_cloned = runtime.clone();
+    let rt_cloned = Arc::downgrade(&runtime);
 
     let event_ix = rwrite.get_next_event_ix();
     let next_trigger = time::Instant::now() + timer;
@@ -71,13 +84,15 @@ where TD: Send + Sync + 'static {
         loop { 
             thread::sleep(timer);
             // println!("Waking");
-            let wakers: SmallVec<[Arc<mio::Waker>; AVG_CORES]> = rt_cloned.read().wakers.iter().cloned().collect();
-            for waker in wakers {
-                waker.wake().ok();
-            }
-            if !repeat {
-                break;
-            }
+            if let Some(rt_cloned) = rt_cloned.upgrade() {
+                if rt_cloned.read().should_exit { break; }
+
+                let wakers: SmallVec<[Arc<mio::Waker>; AVG_CORES]> = rt_cloned.read().wakers.iter().cloned().collect();
+                wake_all(wakers.iter());
+                if !repeat {
+                    break;
+                }
+            } else { break; }
             // TODO: cancellation check here
             // for event in runtime.write().timer_events.iter_mut().filter(
             //     |item| { item.event_ix == event_ix }) {
@@ -111,6 +126,7 @@ impl<TD: Send + Sync + 'static> Runtime<TD> {
             next_token: 0,
             next_event_ix: 0,
             started: false,
+            should_exit: false,
             // callbacks: SmallVec::new(),
         };
 
@@ -222,9 +238,14 @@ impl<TD: Send + Sync + 'static> Runtime<TD> {
                     // println!("Thread {} awoken.", thread_ix);
                     let timer_events = runtime.read().timer_events.clone();
                     // acts like a Mutex to prevent double triggering
-                    let mut timer_events = timer_events.write();
-                    Self::handle_timer_events(&mut timer_events, &mut runtime)?;
-                    Self::prune_timer_events(&mut timer_events);
+                    let mut timer_ev_write = timer_events.write();
+                    Self::handle_timer_events(&mut timer_ev_write, &mut runtime)?;
+                    Self::prune_timer_events(&mut timer_ev_write);
+                    drop(timer_ev_write);
+
+                    if runtime.read().should_exit {
+                        break 'event_loop;
+                    }
                 }
             }
         }

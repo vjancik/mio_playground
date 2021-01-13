@@ -1,5 +1,5 @@
+use std::{thread, time::{self, Duration}};
 use num_cpus;
-use std::time::{self, Duration};
 use mio::{self, net::UdpSocket};
 use anyhow::Result;
 use cfg_if;
@@ -51,14 +51,14 @@ fn main() -> Result<()> {
             sock.set_reuse_address(true);
             }
         }
-        sock.bind(&format!("[::0]:{}", port).parse::<std::net::SocketAddr>()?.into())?;
+        sock.bind(&format!("[::1]:{}", port).parse::<std::net::SocketAddr>()?.into())?;
         let mut mio_sock = UdpSocket::from_std(sock.into_udp_socket());
         let event_source_id = runtime.register_event_source(&mut mio_sock, None, i)?;
         runtime.register_source_event_handler(event_source_id, udp_handler_factory());
         runtime.set_thread_data(i, ThreadData { thread_ix: i, udp_socket: mio_sock });
     }
 
-    let runtime = runtime.start();
+    let mut runtime = runtime.start();
 
     let now = time::Instant::now();
     let timer = Duration::from_millis(1000);
@@ -68,15 +68,18 @@ fn main() -> Result<()> {
     }));
 
     // temporary
-    let send_sock = std::net::UdpSocket::bind("[::0]:0")?;
+    let send_sock = std::net::UdpSocket::bind("[::1]:0")?;
     let msg = "Hello world".as_bytes();
 
-    let now = time::Instant::now();
+    // let now = time::Instant::now();
     runtime::register_timer_event(&runtime, Duration::from_millis(500), true, Box::new(move |_runtime| {
         // println!("Sending message, elapsed: {}", now.elapsed().as_millis());
-        send_sock.send_to(msg, format!("[::0]:{}", port))?;
+        send_sock.send_to(msg, format!("[::1]:{}", port))?;
         Ok(())
     }));
+
+    thread::sleep(Duration::from_secs(5));
+    runtime::send_stop_signal(&mut runtime);
 
     runtime::block_until_finished(runtime)?;
     Ok(())
