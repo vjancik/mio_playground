@@ -71,7 +71,9 @@ fn main() -> Result<()> {
     let send_sock = std::net::UdpSocket::bind("[::0]:0")?;
     let msg = "Hello world".as_bytes();
 
+    let now = time::Instant::now();
     runtime::register_timer_event(&runtime, Duration::from_millis(500), true, Box::new(move |_runtime| {
+        // println!("Sending message, elapsed: {}", now.elapsed().as_millis());
         send_sock.send_to(msg, format!("[::0]:{}", port))?;
         Ok(())
     }));
