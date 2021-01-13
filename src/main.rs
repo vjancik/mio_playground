@@ -13,18 +13,21 @@ use runtime::*;
 mod runtime {
     use super::*;
 
+    pub trait SharedData: Send + Sync + 'static {}
+
     type Thunk = dyn Fn() -> () + Send + Sync;
     // type Callback<T> = dyn Fn(T) -> Result<()> + Send + Sync;
-    pub type Handler = dyn Fn(&mut Arc<RwLock<Runtime>>, &mio::event::Event) -> Result<()> + Send + Sync;
+    pub type Handler<T> = dyn Fn(&mut Arc<RwLock<Runtime<T>>>, &mut Arc<RwLock<Option<T>>>, &mio::event::Event) -> Result<()> + Send + Sync;
 
-    pub struct Runtime {
+    pub struct Runtime<T: SharedData> {
         pub polls: SmallVec<[Arc<RwLock<mio::Poll>>; 8]>,
         pub wakers: SmallVec<[Arc<mio::Waker>; 8]>,
         pub join_handles: SmallVec<[Option<thread::JoinHandle<Result<()>>>; 8]>,
         pub nthreads: usize,
+        pub shared_data: SmallVec<[Arc<RwLock<Option<T>>>; 8]>,
         callbacks: SmallVec<[Box<Thunk>; 5]>,
         timer_events: SmallVec<[TimerEvent; 10]>,
-        source_handlers: Arc<RwLock<SmallVec<[SourceHandler; 8 * 2]>>>,
+        source_handlers: Arc<RwLock<SmallVec<[SourceHandler<T>; 8 * 2]>>>,
         next_token: usize,
         next_event_ix: usize,
     }
@@ -44,13 +47,13 @@ mod runtime {
         repeat: bool,
     }
 
-    struct SourceHandler {
+    struct SourceHandler<T: SharedData> {
         source_id: mio::Token,
-        handler: Box<Handler>
+        handler: Box<Handler<T>>
     }
 
     /// if repeat is true, the timer becomes periodic until cancelled
-    pub fn register_timer_event(runtime: &Arc<RwLock<Runtime>>, timer: time::Duration, repeat: bool, handler: Box<Thunk>) {
+    pub fn register_timer_event<T: SharedData>(runtime: &Arc<RwLock<Runtime<T>>>, timer: time::Duration, repeat: bool, handler: Box<Thunk>) {
         let mut rwrite = runtime.write();
         let rt_cloned = runtime.clone();
 
@@ -81,7 +84,7 @@ mod runtime {
         rwrite.join_handles.push(Some(handle));
     }
 
-    pub fn block_until_finished(runtime: Arc<RwLock<Runtime>>) -> Result<()> {
+    pub fn block_until_finished<T: SharedData>(runtime: Arc<RwLock<Runtime<T>>>) -> Result<()> {
         let join_handles: SmallVec<[thread::JoinHandle<Result<()>>; 8]> = runtime.write().join_handles.iter_mut()
             .map(|item| { item.take().unwrap() }).collect();
         for handle in join_handles {
@@ -90,7 +93,7 @@ mod runtime {
         Ok(())
     }
 
-    impl Runtime {
+    impl<T: SharedData> Runtime<T> {
         pub fn new(nthreads: usize) -> Result<Self> {
             let mut runtime = Runtime {
                 polls: SmallVec::new(),
@@ -99,6 +102,7 @@ mod runtime {
                 callbacks: SmallVec::new(),
                 timer_events: SmallVec::new(),
                 source_handlers: Arc::new(RwLock::new(SmallVec::new())),
+                shared_data: SmallVec::new(),
                 nthreads,
                 next_token: 0,
                 next_event_ix: 0,
@@ -110,6 +114,8 @@ mod runtime {
 
                 let waker = mio::Waker::new(poll.read().registry(), runtime.get_next_token())?;
                 runtime.wakers.push(Arc::new(waker));
+
+                runtime.shared_data.push(Arc::new(RwLock::new(None)));
             }
 
             Ok(runtime)
@@ -136,11 +142,16 @@ mod runtime {
         }
 
         // TODO: partition per poll / thread
-        pub fn register_source_event_handler(&mut self, token: mio::Token, handler: Box<Handler>) {
+        pub fn register_source_event_handler(&mut self, token: mio::Token, handler: Box<Handler<T>>) {
             self.source_handlers.write().push(SourceHandler {
                 source_id: token,
                 handler
             });
+        }
+
+        pub fn set_thread_shared_data(&mut self, thread_ix: usize, data: T) -> Arc<RwLock<Option<T>>> {
+            *self.shared_data[thread_ix].write() = Some(data);
+            self.shared_data[thread_ix].clone()
         }
 
 
@@ -170,6 +181,7 @@ mod runtime {
         { move || { 
             let poll = runtime.read().polls[thread_ix].clone();
             let handlers = runtime.read().source_handlers.clone();
+            let mut shared_data = runtime.read().shared_data[thread_ix].clone();
             let mut events = mio::Events::with_capacity(1000);
 
             for cb in &runtime.read().callbacks {
@@ -181,7 +193,7 @@ mod runtime {
                 poll.write().poll(&mut events, None)?;
                 for event in events.iter() {
                     for handler in handlers.read().iter().filter(|handler| { handler.source_id == event.token() }) {
-                        (*handler.handler)(&mut runtime, event)?;
+                        (*handler.handler)(&mut runtime, &mut shared_data, event)?;
                     }
                     // Token(thread_ix) is Waker
                     if event.token() == mio::Token(thread_ix) {
@@ -224,12 +236,13 @@ mod runtime {
 //     println!("Function: Thread {}: Hello world", ix);
 // }
 
-fn udp_handler_factory(udp_socket: mio::net::UdpSocket) -> Box<runtime::Handler> 
+fn udp_handler_factory() -> Box<runtime::Handler<SharedData>> 
 { 
     // TODO: Must exhaust socket
-    Box::new(move |_runtime, event| {
+    Box::new(move |_runtime, shared_data, event| {
         let mut buf = [0u8; 1500];
-
+        let udp_socket = shared_data.write().take().unwrap().udp_socket;
+        
         if event.is_readable() {
             let (nread, from) = udp_socket.recv_from(&mut buf)?;
             println!("Received message: \"{:?}\" from: {}", &buf[..nread], from)
@@ -238,10 +251,16 @@ fn udp_handler_factory(udp_socket: mio::net::UdpSocket) -> Box<runtime::Handler>
     })
 }
 
+struct SharedData {
+    udp_socket: mio::net::UdpSocket
+}
+
+impl runtime::SharedData for SharedData {}
+
 fn main() -> Result<()> {
     let nthreads = num_cpus::get();
     let port = 44444;
-    let mut runtime = Runtime::new(nthreads)?;
+    let mut runtime = Runtime::<SharedData>::new(nthreads)?;
     // runtime.register_callback(Box::new(|i| {println!("Closure: Thread {}: Hello world", i)}));
     // runtime.register_callback(Box::new(any_func));
 
@@ -259,7 +278,8 @@ fn main() -> Result<()> {
         sock.bind(&format!("[::0]:{}", port).parse::<std::net::SocketAddr>()?.into())?;
         let mut mio_sock = UdpSocket::from_std(sock.into_udp_socket());
         let event_source_id = runtime.register_event_source(&mut mio_sock, None, i)?;
-        runtime.register_source_event_handler(event_source_id, udp_handler_factory(mio_sock));
+        runtime.register_source_event_handler(event_source_id, udp_handler_factory());
+        runtime.set_thread_shared_data(i, SharedData { udp_socket: mio_sock });
     }
 
     let runtime = runtime.start();
