@@ -44,39 +44,39 @@ mod runtime {
 
     /// if repeat is true, the timer becomes periodic until cancelled
     pub fn register_timer_event(runtime: &Arc<RwLock<Runtime>>, timer: time::Duration, repeat: bool, handler: Box<Thunk>) {
-        let runtime = runtime.clone();
         let mut rwrite = runtime.write();
+        let rt_cloned = runtime.clone();
 
         let event_ix = rwrite.get_next_event_ix();
         let next_trigger = time::Instant::now() + timer;
 
         rwrite.timer_events.push(TimerEvent { event_ix, handler, repeat, last_triggered: None, timer, next_trigger });
 
-        drop(rwrite);
-        thread::spawn(move || {
+        let handle = thread::spawn(move || -> Result<()> {
             loop { 
                 thread::sleep(timer);
                 // println!("Waking");
-                let wakers: SmallVec<[Arc<mio::Waker>; 8]> = runtime.read().wakers.iter().cloned().collect();
+                let wakers: SmallVec<[Arc<mio::Waker>; 8]> = rt_cloned.read().wakers.iter().cloned().collect();
                 for waker in wakers {
                     waker.wake().ok();
                 }
                 if !repeat {
-                    break
+                    break;
                 }
                 // for event in runtime.write().timer_events.iter_mut().filter(
                 //     |item| { item.event_ix == event_ix }) {
                 //     event.handled = false;
                 // }
             }
+            Ok(())
         });
+        rwrite.join_handles.push(Some(handle));
     }
 
     pub fn block_until_finished(runtime: Arc<RwLock<Runtime>>) -> Result<()> {
         let join_handles: SmallVec<[thread::JoinHandle<Result<()>>; 8]> = runtime.write().join_handles.iter_mut()
             .map(|item| { item.take().unwrap() }).collect();
         for handle in join_handles {
-            // NOTE: FML
             handle.join().unwrap()?;
         }
         Ok(())
@@ -153,6 +153,10 @@ mod runtime {
                             if event.token() == mio::Token(i) {
                                 // println!("Thread {} awoken.", i);
                                 runtime_clone.write().handle_timer_events();
+                                if runtime_clone.read().timer_events.len() == 0
+                                {
+                                    break 'event_loop;
+                                }
                             }
                         }
                     }
@@ -192,7 +196,7 @@ fn main() -> Result<()> {
 
     let now = time::Instant::now();
     let timer = Duration::from_millis(100);
-    runtime::register_timer_event(&runtime, timer, true, Box::new(move || {
+    runtime::register_timer_event(&runtime, timer, false, Box::new(move || {
         println!("Printing every {:?}, elapsed: {}", timer, now.elapsed().as_millis());
     }));
 
