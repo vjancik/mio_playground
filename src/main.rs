@@ -34,8 +34,6 @@ struct ThreadData {
     udp_socket: mio::net::UdpSocket
 }
 
-impl runtime::ThreadSafe for ThreadData {}
-
 fn main() -> Result<()> {
     let nthreads = num_cpus::get();
     let port = 44444;

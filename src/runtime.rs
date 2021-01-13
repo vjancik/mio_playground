@@ -8,13 +8,11 @@ use smallvec::SmallVec;
 
 const AVG_CORES: usize = 8;
 
-pub trait ThreadSafe: Send + Sync + 'static {}
-
 type Thunk = dyn Fn() -> Result<()> + Send + Sync;
 // type Callback<TD> = dyn Fn(TD) -> Result<()> + Send + Sync;
 pub type Handler<TD> = dyn Fn(&mut Arc<RwLock<Runtime<TD>>>, &mut TD, &mio::event::Event) -> Result<()> + Send + Sync;
 
-pub struct Runtime<TD: ThreadSafe> {
+pub struct Runtime<TD: Send + Sync + 'static> {
     nthreads: usize,
     wakers: SmallVec<[Arc<mio::Waker>; AVG_CORES]>,
     polls: SmallVec<[Option<mio::Poll>; AVG_CORES]>,
@@ -43,13 +41,15 @@ struct TimerEvent {
     repeat: bool,
 }
 
-struct SourceHandler<TD: ThreadSafe> {
+struct SourceHandler<TD: Send + Sync + 'static> {
     source_id: mio::Token,
     handler: Box<Handler<TD>>
 }
 
 /// if repeat is true, the timer becomes periodic until cancelled
-pub fn register_timer_event<TD: ThreadSafe>(runtime: &Arc<RwLock<Runtime<TD>>>, timer: time::Duration, repeat: bool, handler: Box<Thunk>) {
+pub fn register_timer_event<TD>(runtime: &Arc<RwLock<Runtime<TD>>>, timer: time::Duration, 
+    repeat: bool, handler: Box<Thunk>) 
+where TD: Send + Sync + 'static {
     let mut rwrite = runtime.write();
     let rt_cloned = runtime.clone();
 
@@ -80,7 +80,7 @@ pub fn register_timer_event<TD: ThreadSafe>(runtime: &Arc<RwLock<Runtime<TD>>>, 
     rwrite.join_handles.push(Some(handle));
 }
 
-pub fn block_until_finished<TD: ThreadSafe>(runtime: Arc<RwLock<Runtime<TD>>>) -> Result<()> {
+pub fn block_until_finished<TD: Send + Sync + 'static>(runtime: Arc<RwLock<Runtime<TD>>>) -> Result<()> {
     let join_handles: SmallVec<[thread::JoinHandle<Result<()>>; AVG_CORES]> = runtime.write().join_handles.iter_mut()
         .map(|item| { item.take().unwrap() }).collect();
     for handle in join_handles {
@@ -89,7 +89,7 @@ pub fn block_until_finished<TD: ThreadSafe>(runtime: Arc<RwLock<Runtime<TD>>>) -
     Ok(())
 }
 
-impl<TD: ThreadSafe> Runtime<TD> {
+impl<TD: Send + Sync + 'static> Runtime<TD> {
     pub fn new(nthreads: usize) -> Result<Self> {
         let mut runtime = Runtime {
             polls: SmallVec::new(),
