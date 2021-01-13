@@ -35,7 +35,7 @@ struct EventIndex(usize);
 /// Can trigger multiple times in rapid succession if multiple timer periods were missed
 struct TimerEvent<TD: Send + Sync + 'static> {
     //TODO: cancelling
-    // #[allow(dead_code)]
+    #[allow(dead_code)]
     event_ix: EventIndex,
     // TODO: change to runtime shared data callback
     handler: Box<TimerEvHandler<TD>>,
@@ -80,7 +80,7 @@ where TD: Send + Sync + 'static {
     };
     rwrite.timer_events.write().push(timer_ev);
 
-    let handle = thread::spawn(move || -> Result<()> {
+    thread::spawn(move || -> Result<()> {
         loop { 
             thread::sleep(timer);
             // println!("Waking");
@@ -101,7 +101,7 @@ where TD: Send + Sync + 'static {
         }
         Ok(())
     });
-    rwrite.join_handles.push(Some(handle));
+    // rwrite.join_handles.push(Some(handle));
 }
 
 pub fn block_until_finished<TD: Send + Sync + 'static>(runtime: Arc<RwLock<Runtime<TD>>>) -> Result<()> {
