@@ -2,12 +2,11 @@ use num_cpus;
 use std::thread;
 use std::sync::Arc;
 use std::time::{self, Duration};
-// use std::collections::HashMap;
-use mio;
+use mio::{self, net::UdpSocket};
 use anyhow::Result;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
-// use std::convert::TryInto;
+use cfg_if;
 
 use runtime::*;
 
@@ -15,6 +14,8 @@ mod runtime {
     use super::*;
 
     type Thunk = dyn Fn() -> () + Send + Sync;
+    // type Callback<T> = dyn Fn(T) -> Result<()> + Send + Sync;
+    pub type Handler = dyn Fn(&mut Arc<RwLock<Runtime>>, &mio::event::Event) -> Result<()> + Send + Sync;
 
     pub struct Runtime {
         pub polls: SmallVec<[Arc<RwLock<mio::Poll>>; 8]>,
@@ -23,6 +24,7 @@ mod runtime {
         pub nthreads: usize,
         callbacks: SmallVec<[Box<Thunk>; 5]>,
         timer_events: SmallVec<[TimerEvent; 10]>,
+        source_handlers: Arc<RwLock<SmallVec<[SourceHandler; 8 * 2]>>>,
         next_token: usize,
         next_event_ix: usize,
     }
@@ -40,6 +42,11 @@ mod runtime {
         next_trigger: time::Instant,
         last_triggered: Option<time::Instant>,
         repeat: bool,
+    }
+
+    struct SourceHandler {
+        source_id: mio::Token,
+        handler: Box<Handler>
     }
 
     /// if repeat is true, the timer becomes periodic until cancelled
@@ -63,6 +70,7 @@ mod runtime {
                 if !repeat {
                     break;
                 }
+                // TODO: cancellation check here
                 // for event in runtime.write().timer_events.iter_mut().filter(
                 //     |item| { item.event_ix == event_ix }) {
                 //     event.handled = false;
@@ -90,6 +98,7 @@ mod runtime {
                 join_handles: SmallVec::new(),
                 callbacks: SmallVec::new(),
                 timer_events: SmallVec::new(),
+                source_handlers: Arc::new(RwLock::new(SmallVec::new())),
                 nthreads,
                 next_token: 0,
                 next_event_ix: 0,
@@ -111,6 +120,29 @@ mod runtime {
             self.callbacks.push(Box::new(cb));
         }
 
+        /// if interests: None, defaults to READABLE + WRITABLE
+        pub fn register_event_source<S>(&mut self, source: &mut S, interests: Option<mio::Interest>, 
+            thread_id: usize) -> Result<mio::Token>
+        where S: mio::event::Source 
+        {
+            if thread_id >= self.nthreads {
+                panic!("Can't register source with an unitialized thread");
+            }
+            let source_token = self.get_next_token();
+            let interests = interests.unwrap_or(mio::Interest::READABLE.add(mio::Interest::WRITABLE));
+
+            self.polls[thread_id].read().registry().register(source, source_token, interests)?;
+            Ok(source_token)
+        }
+
+        // TODO: partition per poll / thread
+        pub fn register_source_event_handler(&mut self, token: mio::Token, handler: Box<Handler>) {
+            self.source_handlers.write().push(SourceHandler {
+                source_id: token,
+                handler
+            });
+        }
+
 
         #[inline]
         fn trigger_timer_event(event: &mut TimerEvent, delay: time::Duration) -> bool {
@@ -120,6 +152,8 @@ mod runtime {
             event.repeat
         }
 
+        // TODO: Arc<RwLock<>> the TimerEvent and split into two methods, one which calls the handlers
+        //       and modifies the events (runtime read lock), the second which prunes the finished events
         fn handle_timer_events(&mut self) {
             self.timer_events.retain(|event| {
                 match time::Instant::now().checked_duration_since(event.next_trigger) {
@@ -131,38 +165,41 @@ mod runtime {
             });
         }
 
+        fn executor_loop_factory(mut runtime: Arc<RwLock<Self>>, thread_ix: usize)
+            -> impl FnOnce() -> Result<()>
+        { move || { 
+            let poll = runtime.read().polls[thread_ix].clone();
+            let handlers = runtime.read().source_handlers.clone();
+            let mut events = mio::Events::with_capacity(1000);
+
+            for cb in &runtime.read().callbacks {
+                cb();
+            }
+            
+            #[allow(unused_labels)]
+            'event_loop: loop {
+                poll.write().poll(&mut events, None)?;
+                for event in events.iter() {
+                    for handler in handlers.read().iter().filter(|handler| { handler.source_id == event.token() }) {
+                        (*handler.handler)(&mut runtime, event)?;
+                    }
+                    // Token(thread_ix) is Waker
+                    if event.token() == mio::Token(thread_ix) {
+                        // println!("Thread {} awoken.", thread_ix);
+                        runtime.write().handle_timer_events();
+                    }
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok(())
+        }}
+
         pub fn start(self) -> Arc<RwLock<Self>> {
             let runtime = Arc::new(RwLock::new(self));
             let mut rwrite = runtime.write();
 
             for i in 0..rwrite.nthreads {
-                let runtime_clone = runtime.clone();
-
-                let handle = thread::spawn(move || -> Result<()> {
-                    let poll = runtime_clone.read().polls[i].clone();
-                    let mut events = mio::Events::with_capacity(5);
-
-                    for cb in &runtime_clone.read().callbacks {
-                        cb();
-                    }
-                    
-                    #[allow(unused_labels)]
-                    'event_loop: loop {
-                        poll.write().poll(&mut events, None)?;
-                        for event in events.iter() {
-                            if event.token() == mio::Token(i) {
-                                // println!("Thread {} awoken.", i);
-                                runtime_clone.write().handle_timer_events();
-                                if runtime_clone.read().timer_events.len() == 0
-                                {
-                                    break 'event_loop;
-                                }
-                            }
-                        }
-                    }
-                    #[allow(unreachable_code)]
-                    Ok(())
-                });
+                let handle = thread::spawn(Self::executor_loop_factory(runtime.clone(), i));
                 rwrite.join_handles.push(Some(handle));
             }
             drop(rwrite);
@@ -187,11 +224,44 @@ mod runtime {
 //     println!("Function: Thread {}: Hello world", ix);
 // }
 
+fn udp_handler_factory(udp_socket: mio::net::UdpSocket) -> Box<runtime::Handler> 
+{ 
+    // TODO: Must exhaust socket
+    Box::new(move |_runtime, event| {
+        let mut buf = [0u8; 1500];
+
+        if event.is_readable() {
+            let (nread, from) = udp_socket.recv_from(&mut buf)?;
+            println!("Received message: \"{:?}\" from: {}", &buf[..nread], from)
+        }
+        Ok(())
+    })
+}
+
 fn main() -> Result<()> {
     let nthreads = num_cpus::get();
-    let runtime = Runtime::new(nthreads)?;
+    let port = 44444;
+    let mut runtime = Runtime::new(nthreads)?;
     // runtime.register_callback(Box::new(|i| {println!("Closure: Thread {}: Hello world", i)}));
     // runtime.register_callback(Box::new(any_func));
+
+    for i in 0..nthreads {
+        use socket2::{Socket, Domain, Protocol, Type};
+        let sock = Socket::new(Domain::ipv6(), Type::dgram().non_blocking(), Some(Protocol::udp()))?;
+        cfg_if::cfg_if! {
+            if #[cfg(all(unix, 
+                not(any(target_os = "solaris", target_os = "illumos"))))] {
+                sock.set_reuse_port(true)?;
+            } else {
+            sock.set_reuse_address(true);
+            }
+        }
+        sock.bind(&format!("[::0]:{}", port).parse::<std::net::SocketAddr>()?.into())?;
+        let mut mio_sock = UdpSocket::from_std(sock.into_udp_socket());
+        let event_source_id = runtime.register_event_source(&mut mio_sock, None, i)?;
+        runtime.register_source_event_handler(event_source_id, udp_handler_factory(mio_sock));
+    }
+
     let runtime = runtime.start();
 
     let now = time::Instant::now();
@@ -199,6 +269,11 @@ fn main() -> Result<()> {
     runtime::register_timer_event(&runtime, timer, false, Box::new(move || {
         println!("Printing every {:?}, elapsed: {}", timer, now.elapsed().as_millis());
     }));
+
+    // temporary
+    let send_sock = std::net::UdpSocket::bind("[::0]:0")?;
+    let msg = "Hello world".as_bytes();
+    send_sock.send_to(msg, format!("[::0]:{}", port))?;
 
     runtime::block_until_finished(runtime)?;
     Ok(())

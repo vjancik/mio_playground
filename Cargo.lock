@@ -78,10 +78,12 @@ name = "mio_playground"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cfg-if 1.0.0",
  "mio",
  "num_cpus",
  "parking_lot",
  "smallvec",
+ "socket2",
 ]
 
 [[package]]
